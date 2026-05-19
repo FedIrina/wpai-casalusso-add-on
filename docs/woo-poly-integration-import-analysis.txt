@@ -1,0 +1,199 @@
+Анализ woo-poly-integration_enhanced и требования к импорту товаров
+====================================================================
+Дата: 2026-05-18
+Контекст: что нужно добавить в wpai-casalusso-add-on, чтобы импортированные товары
+получили всё необходимое для связанных языковых версий, как при создании из админки.
+
+Сайт dev: язык по умолчанию ru; языки ru, en, de, tr.
+Типы в Polylang: product, product_variation.
+
+
+1. Базовый слой Polylang (обязателен для любой связки)
+------------------------------------------------------
+
+| Механизм           | Вид              | Назначение |
+|--------------------|------------------|------------|
+| language           | таксономия поста | slug языка (ru, en, de, tr) |
+| post_translations  | таксономия поста | термин группы; в description — сериализованный массив { slug => post_id } |
+
+wpai-casalusso-add-on УЖЕ делает: language + post_translations (через прямую работу
+с терминами, без pll_save_post_translations()).
+
+
+2. Что делает woo-poly при создании перевода в админке
+------------------------------------------------------
+
+Сценарий: «Добавить перевод» (?from_post=ID&new_lang=en).
+
+Шаг A — Polylang при первом открытии формы
+  new_post_translation() копирует с исходного поста:
+  - таксономии — PLL()->sync->taxonomies->copy();
+  - мета — PLL()->sync->post_metas->copy() (список расширяется фильтром pll_copy_post_metas).
+
+Шаг B — woo-poly на save_post_product
+
+  Meta::syncTaxonomiesAndProductAttributes() — для каждой таксономии товара:
+
+  | Таксономия                              | Поведение |
+  |-----------------------------------------|-----------|
+  | language, post_translations, term_*     | не трогает |
+  | product_type, product_visibility        | копирует slug как есть (синхронизация) |
+  | product_shipping_class                  | синхронизация (если включена в настройках мета) |
+  | product_cat, product_tag, pa_*          | если переводимая — pll_get_term() → term_id нужного языка; если перевода нет — может создать |
+  | pa_* на dev                             | pa_czvet, pa_razmer, pa_color и др. — через Polylang как переводимые |
+
+  Meta::syncCustomProductAttributes() — не-таксономические атрибуты (is_taxonomy == 0).
+
+  Variable::duplicateVariations() (только variable):
+  - источник — товар на pll_default_language() (ru);
+  - для каждого другого языка создаёт/обновляет вариации (product_variation);
+  - pll_set_post_language() = язык родителя;
+  - мета _point_to_variation = ID вариации в версии на дефолтном языке;
+  - copyVariationMetas; для attribute_* — перевод slug термина через pll_get_term.
+
+  Variable::syncDefaultAttributes() — _default_attributes с переводом slug атрибутов.
+
+  Meta::addProductTypeMeta() — _translation_porduct_type (тип товара на момент создания перевода).
+
+Шаг C — синхронизация мета (фильтр pll_copy_post_metas)
+
+  Woo-poly подменяет список копируемых мета. На dev включено ~50 полей, в том числе:
+
+  - общие: _sku, _virtual, _upsell_ids, _crosssell_ids, _product_image_gallery, _visibility, …
+  - Polylang: menu_order, _thumbnail_id, comment_status
+  - склад: _manage_stock, _stock, _stock_status, …
+  - доставка: _weight, _length, … + product_shipping_class
+  - атрибуты: _product_attributes, _default_attributes
+  - цены: _regular_price, _sale_price, _price, …
+  - variable: _min_variation_price, _max_variation_price, …
+
+  Важно: _sku синхронизируется между переводами (один SKU на все языки).
+
+  Не копируется при повторном сохранении: _variation_description (если уже есть у перевода).
+
+Шаг D — остальное
+  - Stock — при изменении остатка через WC API дублирует на все переводы (и вариации через _point_to_variation).
+  - Категории/теги — term meta (display_type, thumbnail_id) синхронизируются между переводами терминов.
+  - Метки атрибутов — через pll_register_string / pll__() (строки, не посты).
+
+
+3. Что остаётся «переводимым» (из CSV / вручную)
+------------------------------------------------
+
+Не синхронизируется как копия с дефолтного языка (должно быть своё на каждом языке):
+  - post_title, post_content, post_excerpt
+  - переводимые термины: product_cat, product_tag, pa_* — нужны term_id именно этого языка
+  - slug/URL, SEO (если подключено)
+
+При опции new-translation-defaults woo-poly может подставить title/content/excerpt с исходного
+поста в форму — при импорте это не срабатывает, но WPAI заполняет поля из файла.
+
+
+4. Импорт WP All Import vs админка
+----------------------------------
+
+| Действие                              | Админка + woo-poly              | wpai-casalusso-add-on + WPAI |
+|---------------------------------------|---------------------------------|------------------------------|
+| language                              | да                              | да (#1, #3, новые)           |
+| post_translations                     | да (pll_save_post_translations) | да (вручную)               |
+| Копия ~50 meta с ru → переводы        | да                              | НЕТ                          |
+| Таксономии с pll_get_term             | да                              | НЕТ (WPAI из своего файла)   |
+| Вариации + _point_to_variation        | да                              | НЕТ (хук только в post.php)  |
+| _default_attributes с переводом slug  | да                              | НЕТ                          |
+| _translation_porduct_type             | да                              | НЕТ                          |
+| pll_save_post                         | да                              | НЕТ                          |
+| woo-poly onImport                     | только импортёр WooCommerce     | НЕТ                          |
+
+Хуки duplicateVariations и syncTaxonomiesAndProductAttributes завязаны на админку
+(post.php, $_GET['from_post'], $_GET['new_lang']). WP All Import их не вызывает.
+
+
+5. Что добавить в wpai-casalusso-add-on
+---------------------------------------
+
+После связывания по SKU (лучше когда в группе уже есть товар на ru):
+
+Минимум (Polylang + связь)
+  1. pll_save_post_translations( $translations ) вместо ручного wp_insert_term / wp_update_term.
+  2. После связи — для каждого перевода не на ru:
+       PLL()->sync->post_metas->copy( $default_id, $translation_id, $lang );
+       PLL()->sync->taxonomies->copy( $default_id, $translation_id, $lang );
+     (как в new_post_translation), с фильтром woo-poly pll_copy_post_metas.
+
+Для вариативных (импорт #3)
+  3. Программно повторить Variation::duplicate() с родителя ru → на переводы.
+  4. syncDefaultAttributes / Utilities::getDefaultAttributesTranslation() для _default_attributes.
+  5. Убедиться, что термины атрибутов (pa_*) существуют во всех языках до привязки к товару.
+
+Дополнительно
+  6. _translation_porduct_type на товаре-источнике (ru).
+  7. do_action( 'pll_save_post', $post_id, $post, $translations ) после связи.
+  8. Порядок импорта: сначала ru, потом en/de/tr с тем же SKU.
+  9. Импорт #5 (vars_info) — отдельно от woo-poly; wpai_casalusso_make_vars_string к Polylang не относится.
+
+Уже в add-on (не Polylang, но на сайте)
+  - _display_with_quantity_attributes для pa_czvet — тема/alt-variations, не woo-poly.
+
+
+6. Схема «как в админке»
+------------------------
+
+  [Товар ru импортирован WPAI]
+           ↓
+  pll_set_post_language(ru)
+           ↓
+  [Импорт en/de/tr с тем же SKU]
+           ↓
+  pll_save_post_translations
+           ↓
+  copy post_metas (ru → translation)
+  copy taxonomies (ru → translation)
+           ↓
+  [variable?] → duplicateVariations + _point_to_variation
+           → syncDefaultAttributes
+           ↓
+  готово
+
+
+Итог
+----
+
+woo-poly опирается на Polylang (language + post_translations) и массовую синхронизацию
+meta/таксономий/вариаций с товара на языке по умолчанию (ru).
+
+wpai-casalusso-add-on покрывает только первый слой. Для полноты нужны программный
+copy metas/taxonomies и для variable — дублирование вариаций.
+
+
+Связанные импорты на dev (на момент анализа)
+---------------------------------------------
+  #1 — Импорт простых товаров (язык + переводы)
+  #3 — Импорт вариативных товаров (язык + переводы)
+  #5 — alt_variations (vars_info, make_vars_string в WPAI functions.php)
+
+
+ОТЛОЖЕНО — обновление существующих товаров (update, не create)
+---------------------------------------------------------------
+Дата: 2026-05-18
+Статус: ждём требования от заказчика.
+
+Вопрос:
+  Как должны вести себя языковые версии при повторном импорте WPAI (is_update),
+  а не при создании новых товаров?
+
+Контекст (кратко):
+  - Сейчас add-on: Polylang + категории только при ! $is_update (импорты #1, #3).
+  - При update add-on почти не трогает связи; WPAI обновляет поля по CSV на matched post.
+  - woo-poly в админке блокирует на переводах редактирование sync-полей (цена, SKU, stock…);
+    переводимы: title, content, product_cat/pa_* и т.д.
+  - woo-poly при save_post может разносить таксономии с сохранённого поста на все переводы
+    (в импорте WPAI часто не срабатывает из‑за fast mode).
+  - onImport woo-poly — только нативный CSV WooCommerce, не WP All Import.
+
+Нужно уточнить у заказчика:
+  1. Что обновлять из CSV на каждом языке (только тексты/категории или и цены/SKU)?
+  2. Нужно ли при update пересвязывать post_translations / product_cat (как при create)?
+  3. Нужна ли синхронизация meta с ru на переводы (как woo-poly в админке)?
+  4. Поведение для вариативных (#3) при update.
+
+После ответа заказчика — доработать assign_language_on_import и/или отдельный блок для update.
