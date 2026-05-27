@@ -10,6 +10,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 class Wpai_Casalusso_Import {
 
 	const PRODUCT_COLLECTION_TAXONOMY = 'collection';
+	const VARIATIONS_PARENT_FIX_LOG   = '/uploads/wpai_casalusso_variations_parent_fix.log';
 
 	/**
 	 * Значение атрибута из CSV (имя, не slug) для текущей строки импорта.
@@ -24,8 +25,10 @@ class Wpai_Casalusso_Import {
 	public static function init() {
 		add_action( 'create_term', array( __CLASS__, 'set_attribute_term_language_on_create' ), 998, 4 );
 		add_filter( 'wp_all_import_term_exists', array( __CLASS__, 'filter_term_exists_by_language' ), 10, 4 );
+		// Временно отключено для контрольного прогона без ранней подмены родителя (см. pmxi_after_post_import).
+		// add_filter( 'pmwi_product_parent_post_id', array( __CLASS__, 'filter_variable_product_parent_post_id' ), 10, 1 );
+		add_action( 'pmxi_after_post_import', array( __CLASS__, 'fix_variation_parent_after_row' ), 999, 1 );
 		add_action( 'pmxi_saved_post', array( __CLASS__, 'assign_language_on_import' ), 10, 3 );
-		add_action( 'wp_all_import_variable_product_imported', array( __CLASS__, 'variable_product_imported' ), 10, 1 );
 	}
 
 	/**
@@ -50,24 +53,360 @@ class Wpai_Casalusso_Import {
 	}
 
 	/**
-	 * Local из current_xml_node текущей строки импорта.
+	 * ID текущего импорта (во время прогона wp_all_import_get_import_id() часто возвращает "new").
+	 *
+	 * @return int
+	 */
+	private static function get_current_import_id() {
+		if ( class_exists( 'Wpai\WordPress\AttachmentHandler' ) && ! empty( \Wpai\WordPress\AttachmentHandler::$importData['import'] ) ) {
+			$import = \Wpai\WordPress\AttachmentHandler::$importData['import'];
+			if ( is_object( $import ) && ! empty( $import->id ) ) {
+				return (int) $import->id;
+			}
+		}
+
+		if ( class_exists( 'PMXI_Plugin' ) && method_exists( 'PMXI_Plugin', 'getCurrentImportId' ) ) {
+			$import_id = PMXI_Plugin::getCurrentImportId();
+			if ( $import_id ) {
+				return (int) $import_id;
+			}
+		}
+
+		$import_id = wp_all_import_get_import_id();
+
+		return is_numeric( $import_id ) ? (int) $import_id : 0;
+	}
+
+	/**
+	 * Лог для диагностики привязки вариаций (импорт #3).
+	 *
+	 * @param string $message
+	 * @return void
+	 */
+	private static function log_variation_parent_fix( $message ) {
+		$path = WP_CONTENT_DIR . self::VARIATIONS_PARENT_FIX_LOG;
+		file_put_contents( $path, $message, FILE_APPEND | LOCK_EX );
+	}
+
+	/**
+	 * Собрать краткую строку контекста строки импорта.
+	 *
+	 * @param int $post_id
+	 * @param int $import_id
+	 * @return string
+	 */
+	private static function get_variation_fix_context_line( $post_id, $import_id ) {
+		$unique_key = '';
+		if ( class_exists( 'PMXI_Post_Record' ) ) {
+			$r = new \PMXI_Post_Record();
+			$r->clear();
+			$r->getBy(
+				array(
+					'import_id' => (int) $import_id,
+					'post_id'   => (int) $post_id,
+				)
+			);
+			if ( ! $r->isEmpty() ) {
+				$unique_key = (string) $r->unique_key;
+			}
+		}
+
+		$local      = self::get_local_for_post_in_import( $post_id, $import_id );
+		$parent_scu = get_post_meta( $post_id, '_parent_sku', true );
+		$parent_scu = $parent_scu !== '' ? trim( (string) $parent_scu ) : '';
+
+		return 'uk=' . $unique_key . ' local=' . $local . ' _parent_sku=' . $parent_scu;
+	}
+
+	/**
+	 * ID текущей строки импорта (WooCommerce Add-On).
+	 *
+	 * @return int
+	 */
+	private static function get_import_row_post_id() {
+		if ( ! class_exists( 'Wpai\WordPress\AttachmentHandler' ) ) {
+			return 0;
+		}
+
+		return (int) ( \Wpai\WordPress\AttachmentHandler::$importData['pid'] ?? 0 );
+	}
+
+	/**
+	 * Local по unique_key записи в pmxi_posts (119070en → en).
+	 *
+	 * @param int $post_id
+	 * @param int $import_id
+	 * @return string
+	 */
+	private static function get_local_for_post_in_import( $post_id, $import_id ) {
+		if ( ! $post_id || ! $import_id || ! class_exists( 'PMXI_Post_Record' ) ) {
+			return '';
+		}
+
+		$post_record = new \PMXI_Post_Record();
+		$post_record->clear();
+		$post_record->getBy(
+			array(
+				'import_id' => $import_id,
+				'post_id'   => $post_id,
+			)
+		);
+
+		if ( $post_record->isEmpty() || ! preg_match( '/(ru|en|tr|de)$/i', $post_record->unique_key, $matches ) ) {
+			return '';
+		}
+
+		return strtolower( $matches[1] );
+	}
+
+	/**
+	 * Local из current_xml_node, иначе суффикс unique_key (119070en → en).
 	 *
 	 * @return string
 	 */
 	private static function get_local_from_import_context() {
-		if ( ! self::is_target_product_import() ) {
+		if ( self::get_current_import_id() !== 3 ) {
 			return '';
 		}
 
-		$node = (array) \Wpai\WordPress\AttachmentHandler::$importData['current_xml_node'];
+		if ( class_exists( 'Wpai\WordPress\AttachmentHandler' ) && ! empty( \Wpai\WordPress\AttachmentHandler::$importData['current_xml_node'] ) ) {
+			$node = (array) \Wpai\WordPress\AttachmentHandler::$importData['current_xml_node'];
 
-		foreach ( array( 'local', 'Local', 'LOCAL' ) as $key ) {
-			if ( isset( $node[ $key ] ) && $node[ $key ] !== '' ) {
-				return strtolower( trim( (string) $node[ $key ] ) );
+			foreach ( array( 'local', 'Local', 'LOCAL' ) as $key ) {
+				if ( isset( $node[ $key ] ) && $node[ $key ] !== '' ) {
+					return strtolower( trim( (string) $node[ $key ] ) );
+				}
+			}
+		}
+
+		$post_id   = self::get_import_row_post_id();
+		$import_id = self::get_current_import_id();
+		if ( $post_id && $import_id ) {
+			$local = self::get_local_for_post_in_import( $post_id, $import_id );
+			if ( $local !== '' ) {
+				return $local;
 			}
 		}
 
 		return '';
+	}
+
+	/**
+	 * Parent_SCU из current_xml_node, иначе meta _parent_sku.
+	 *
+	 * @return string
+	 */
+	private static function get_parent_scu_from_import_context() {
+		if ( self::get_current_import_id() !== 3 ) {
+			return '';
+		}
+
+		if ( class_exists( 'Wpai\WordPress\AttachmentHandler' ) && ! empty( \Wpai\WordPress\AttachmentHandler::$importData['current_xml_node'] ) ) {
+			$node = (array) \Wpai\WordPress\AttachmentHandler::$importData['current_xml_node'];
+
+			foreach ( array( 'parent_scu', 'Parent_SCU', 'PARENT_SCU' ) as $key ) {
+				if ( isset( $node[ $key ] ) && $node[ $key ] !== '' ) {
+					return trim( (string) $node[ $key ] );
+				}
+			}
+		}
+
+		$post_id = self::get_import_row_post_id();
+		if ( $post_id ) {
+			$parent_sku = get_post_meta( $post_id, '_parent_sku', true );
+			if ( $parent_sku !== '' ) {
+				return trim( (string) $parent_sku );
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Родитель variable product по SKU и языку строки (импорт #3).
+	 *
+	 * @param string $sku
+	 * @param string $local
+	 * @return int
+	 */
+	private static function find_variable_parent_by_sku_and_language( $sku, $local ) {
+		$posts = get_posts(
+			array(
+				'post_type'      => 'product',
+				'post_status'    => 'any',
+				'posts_per_page' => -1,
+				'fields'         => 'ids',
+				'meta_query'     => array(
+					array(
+						'key'     => '_sku',
+						'value'   => $sku,
+						'compare' => '=',
+					),
+				),
+			)
+		);
+
+		if ( empty( $posts ) ) {
+			return 0;
+		}
+
+		if ( ! function_exists( 'pll_get_post_language' ) ) {
+			return (int) $posts[0];
+		}
+
+		foreach ( $posts as $post_id ) {
+			if ( pll_get_post_language( $post_id ) === $local ) {
+				return (int) $post_id;
+			}
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Подмена родителя вариации: Parent_SCU + Local вместо первого товара с тем же SKU.
+	 *
+	 * @param int $parent_id ID из pmxi_posts / WooCommerce Add-On.
+	 * @return int
+	 */
+	public static function filter_variable_product_parent_post_id( $parent_id ) {
+		if ( self::get_current_import_id() !== 3 ) {
+			return $parent_id;
+		}
+
+		$resolved = self::resolve_variable_parent_for_current_row();
+
+		return $resolved ? $resolved : $parent_id;
+	}
+
+	/**
+	 * Родитель variable product для текущей строки импорта #3.
+	 *
+	 * @return int
+	 */
+	private static function resolve_variable_parent_for_current_row() {
+		$post_id   = self::get_import_row_post_id();
+		$import_id = self::get_current_import_id();
+
+		return self::resolve_variable_parent_for_post( $post_id, $import_id );
+	}
+
+	/**
+	 * Родитель variable product по Parent_SCU и языку строки.
+	 *
+	 * @param int $post_id
+	 * @param int $import_id
+	 * @return int
+	 */
+	private static function resolve_variable_parent_for_post( $post_id, $import_id ) {
+		if ( ! $post_id || $import_id !== 3 ) {
+			return 0;
+		}
+
+		$local = self::get_local_for_post_in_import( $post_id, $import_id );
+		if ( $local === '' ) {
+			$local = self::get_local_from_import_context();
+		}
+
+		$parent_scu = get_post_meta( $post_id, '_parent_sku', true );
+		$parent_scu = $parent_scu !== '' ? trim( (string) $parent_scu ) : '';
+		if ( $parent_scu === '' ) {
+			$parent_scu = self::get_parent_scu_from_import_context();
+		}
+
+		if ( $local === '' || $parent_scu === '' ) {
+			return 0;
+		}
+
+		return self::find_variable_parent_by_sku_and_language( $parent_scu, $local );
+	}
+
+	/**
+	 * Исправляем post_parent и язык вариации после импорта вариации WooCommerce Add-On'ом.
+	 * WPAI ничего не знает о языковых версиях вариаций, поэтому после импорта вариации WooCommerce Add-On'ом
+	 * мы должны исправить post_parent и язык вариации напрямую в wp_posts вместо того, 
+	 * чтобы использовать WC_Product_Variation::save().
+	 *
+	 * @param int $variation_id
+	 * @param int $import_id
+	 * @return void
+	 */
+	private static function apply_variation_parent_fix( $variation_id, $import_id ) {
+		if ( (int) $import_id !== 3 || get_post_type( $variation_id ) !== 'product_variation' ) {
+			return;
+		}
+
+		$before_parent = (int) wp_get_post_parent_id( $variation_id );
+		$local = self::get_local_for_post_in_import( $variation_id, $import_id );
+		if ( $local === '' ) {
+			$local = self::get_local_from_import_context();
+		}
+
+		$parent_id = self::resolve_variable_parent_for_post( $variation_id, $import_id );
+		if ( ! $parent_id ) {
+			self::log_variation_parent_fix(
+				date( 'Y-m-d H:i:s' ) . ' import=' . (int) $import_id . ' variation=' . (int) $variation_id
+				. ' before_parent=' . $before_parent . ' resolved_parent=0'
+				. ' hook_ctx={' . self::get_variation_fix_context_line( $variation_id, $import_id ) . "}\n"
+			);
+			return;
+		}
+
+		if ( $local !== '' && function_exists( 'pll_set_post_language' ) ) {
+			pll_set_post_language( $variation_id, $local );
+		}
+
+		$current_parent = (int) wp_get_post_parent_id( $variation_id );
+		if ( $current_parent !== $parent_id ) {
+			global $wpdb;
+
+			// Пишем родителя вариации напрямую в wp_posts вместо variation->save, 
+			// так как при импорте WC_Product_Variation::save() после set_parent_id()
+			// снова подставляет post_parent первого попавшегося родителя с тем же SKU, не взирая на локаль.
+			$wpdb->update(
+				$wpdb->posts,
+				array( 'post_parent' => $parent_id ),
+				array( 'ID' => $variation_id ),
+				array( '%d' ),
+				array( '%d' )
+			);
+
+			clean_post_cache( $variation_id );
+			wc_delete_product_transients( $parent_id );
+			if ( $current_parent ) {
+				wc_delete_product_transients( $current_parent );
+			}
+		}
+
+		$after_parent = (int) wp_get_post_parent_id( $variation_id );
+		self::log_variation_parent_fix(
+			date( 'Y-m-d H:i:s' ) . ' import=' . (int) $import_id . ' variation=' . (int) $variation_id
+			. ' before_parent=' . $before_parent . ' resolved_parent=' . (int) $parent_id . ' after_parent=' . $after_parent
+			. ' hook_ctx={' . self::get_variation_fix_context_line( $variation_id, $import_id ) . "}\n"
+		);
+	}
+
+	/**
+	 * В конце строки CSV (запасной хук, если pmxi_update_product_variation не сработал).
+	 *
+	 * @param int $import_id
+	 * @return void
+	 */
+	public static function fix_variation_parent_after_row( $import_id ) {
+		if ( (int) $import_id !== 3 ) {
+			return;
+		}
+
+		$post_id = self::get_import_row_post_id();
+		if ( ! $post_id || get_post_type( $post_id ) !== 'product_variation' ) {
+			return;
+		}
+
+		self::log_variation_parent_fix(
+			date( 'Y-m-d H:i:s' ) . ' hook=pmxi_after_post_import import=' . (int) $import_id
+			. ' pid=' . (int) $post_id . "\n"
+		);
+		self::apply_variation_parent_fix( $post_id, 3 );
 	}
 
 	/**
@@ -440,34 +779,6 @@ class Wpai_Casalusso_Import {
 		}
 
 		update_post_meta( $post_id, '_display_with_quantity_attributes', $display_settings );
-	}
-
-	/**
-	 * @param int $parent_id
-	 * @return void
-	 */
-	public static function variable_product_imported( $parent_id ) {
-		global $log_message;
-
-		$log_message = '';
-
-		$import_id = wp_all_import_get_import_id();
-		if ( $import_id != '3' ) {
-			return;
-		}
-
-		$log_message .= "========================================\n";
-
-		$product = wc_get_product( $parent_id );
-		if ( ! $product ) {
-			return;
-		}
-
-		$variation_ids = $product->get_children();
-		$log_message    .= 'parent_id=' . $parent_id . ', type=variable, variations=' . print_r( $variation_ids, true ) . "\n";
-
-		$log_file = WP_CONTENT_DIR . '/product_taxonomies.log';
-		file_put_contents( $log_file, $log_message . "\n", FILE_APPEND | LOCK_EX );
 	}
 
 	/**
