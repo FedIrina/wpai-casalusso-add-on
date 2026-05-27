@@ -158,7 +158,7 @@ vars_info = [wpai_casalusso_make_vars_string({alt_variations[1]}, {local[1]})]
 1. Одна строка CSV = один товар = один язык. Для той же модели на `en` — отдельная строка с переводами в `Title` и `Alt_variations` и SKU **английских** постов.
 2. SKU в списке должны существовать в WooCommerce на языке `Local`; иначе пара пропускается (см. лог).
 3. Сначала импорт товаров (simple/variable), затем импорт alt-вариаций.
-4. Кодировка файла: **UTF-8**; разделитель — как в настройках импорта #5 (на dev: `;`).
+4. Кодировка файла: **UTF-8**; разделитель — как в настройках update-импорта alt-вариаций (на dev: `;`).
 5. Поле `Alt_variations` с запятыми и `;` в Excel — в кавычках.
 
 Файлы на dev:
@@ -175,7 +175,7 @@ vars_info = [wpai_casalusso_make_vars_string({alt_variations[1]}, {local[1]})]
 
 ## Логирование
 
-При обработке новых товаров (#1 / #3) пишется лог:
+При обработке новых товаров (create-импорт с `local`) пишется лог:
 
 `wp-content/uploads/product_taxonomies.log`
 

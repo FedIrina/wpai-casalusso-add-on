@@ -11,6 +11,7 @@ class Wpai_Casalusso_Import {
 
 	const PRODUCT_COLLECTION_TAXONOMY = 'collection';
 	const VARIATIONS_PARENT_FIX_LOG   = '/uploads/wpai_casalusso_variations_parent_fix.log';
+	const VARIATIONS_PARENT_FIX_DEBUG = false;
 
 	/**
 	 * Значение атрибута из CSV (имя, не slug) для текущей строки импорта.
@@ -25,8 +26,6 @@ class Wpai_Casalusso_Import {
 	public static function init() {
 		add_action( 'create_term', array( __CLASS__, 'set_attribute_term_language_on_create' ), 998, 4 );
 		add_filter( 'wp_all_import_term_exists', array( __CLASS__, 'filter_term_exists_by_language' ), 10, 4 );
-		// Временно отключено для контрольного прогона без ранней подмены родителя (см. pmxi_after_post_import).
-		// add_filter( 'pmwi_product_parent_post_id', array( __CLASS__, 'filter_variable_product_parent_post_id' ), 10, 1 );
 		add_action( 'pmxi_after_post_import', array( __CLASS__, 'fix_variation_parent_after_row' ), 999, 1 );
 		add_action( 'pmxi_saved_post', array( __CLASS__, 'assign_language_on_import' ), 10, 3 );
 	}
@@ -184,6 +183,10 @@ class Wpai_Casalusso_Import {
 	 * @return void
 	 */
 	private static function log_variation_parent_fix( $message ) {
+		if ( ! self::VARIATIONS_PARENT_FIX_DEBUG ) {
+			return;
+		}
+
 		$path = WP_CONTENT_DIR . self::VARIATIONS_PARENT_FIX_LOG;
 		file_put_contents( $path, $message, FILE_APPEND | LOCK_EX );
 	}
@@ -353,35 +356,6 @@ class Wpai_Casalusso_Import {
 		}
 
 		return 0;
-	}
-
-	/**
-	 * Подмена родителя вариации: Parent_SCU + Local вместо первого товара с тем же SKU.
-	 *
-	 * @param int $parent_id ID из pmxi_posts / WooCommerce Add-On.
-	 * @return int
-	 */
-	public static function filter_variable_product_parent_post_id( $parent_id ) {
-		$post_id = self::get_import_row_post_id();
-		if ( ! $post_id || ! self::should_fix_variation_parent( $post_id ) ) {
-			return $parent_id;
-		}
-
-		$resolved = self::resolve_variable_parent_for_current_row();
-
-		return $resolved ? $resolved : $parent_id;
-	}
-
-	/**
-	 * Родитель variable product для текущей строки импорта #3.
-	 *
-	 * @return int
-	 */
-	private static function resolve_variable_parent_for_current_row() {
-		$post_id   = self::get_import_row_post_id();
-		$import_id = self::get_current_import_id();
-
-		return self::resolve_variable_parent_for_post( $post_id, $import_id );
 	}
 
 	/**
