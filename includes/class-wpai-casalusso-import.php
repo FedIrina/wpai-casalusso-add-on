@@ -32,17 +32,11 @@ class Wpai_Casalusso_Import {
 	}
 
 	/**
-	 * Импорты товаров #1 и #3: есть контекст строки CSV в AttachmentHandler.
+	 * Импорт товаров WooCommerce: есть контекст строки CSV в AttachmentHandler.
 	 *
 	 * @return bool
 	 */
-	private static function is_target_product_import() {
-		$import_id = wp_all_import_get_import_id();
-
-		if ( $import_id != '1' && $import_id != '3' ) {
-			return false;
-		}
-
+	private static function is_woocommerce_product_import_context() {
 		if ( ! class_exists( 'Wpai\WordPress\AttachmentHandler' ) || empty( \Wpai\WordPress\AttachmentHandler::$importData ) ) {
 			return false;
 		}
@@ -50,6 +44,112 @@ class Wpai_Casalusso_Import {
 		$data = \Wpai\WordPress\AttachmentHandler::$importData;
 
 		return ! empty( $data['post_type'] ) && $data['post_type'] === 'product';
+	}
+
+	/**
+	 * Импорт товаров с колонкой Local (или суффиксом языка в unique_key).
+	 *
+	 * @return bool
+	 */
+	private static function is_target_product_import() {
+		if ( ! self::is_woocommerce_product_import_context() ) {
+			return false;
+		}
+
+		return self::row_has_language_context() !== '';
+	}
+
+	/**
+	 * @param array|SimpleXMLElement|mixed $xml_node
+	 * @return string
+	 */
+	private static function get_local_from_xml_node( $xml_node ) {
+		$node = (array) $xml_node;
+
+		foreach ( array( 'local', 'Local', 'LOCAL' ) as $key ) {
+			if ( isset( $node[ $key ] ) && $node[ $key ] !== '' ) {
+				return strtolower( trim( (string) $node[ $key ] ) );
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * @param int $post_id
+	 * @param int $import_id
+	 * @return string
+	 */
+	private static function row_has_language_context( $post_id = 0, $import_id = 0 ) {
+		$post_id   = $post_id ? (int) $post_id : self::get_import_row_post_id();
+		$import_id = $import_id ? (int) $import_id : self::get_current_import_id();
+
+		if ( $post_id && $import_id ) {
+			$local = self::get_local_for_post_in_import( $post_id, $import_id );
+			if ( $local !== '' ) {
+				return $local;
+			}
+		}
+
+		return self::get_local_from_import_context();
+	}
+
+	/**
+	 * @param int $post_id
+	 * @return string
+	 */
+	private static function row_has_parent_scu( $post_id = 0 ) {
+		$post_id = $post_id ? (int) $post_id : self::get_import_row_post_id();
+
+		if ( $post_id ) {
+			$parent_sku = get_post_meta( $post_id, '_parent_sku', true );
+			if ( $parent_sku !== '' ) {
+				return trim( (string) $parent_sku );
+			}
+		}
+
+		return self::get_parent_scu_from_import_context();
+	}
+
+	/**
+	 * @param int $variation_id
+	 * @param int $import_id
+	 * @return bool
+	 */
+	private static function should_fix_variation_parent( $variation_id, $import_id = 0 ) {
+		if ( ! $variation_id || get_post_type( $variation_id ) !== 'product_variation' ) {
+			return false;
+		}
+
+		if ( ! self::is_woocommerce_product_import_context() ) {
+			return false;
+		}
+
+		$import_id = $import_id ? (int) $import_id : self::get_current_import_id();
+
+		if ( self::row_has_language_context( $variation_id, $import_id ) === '' ) {
+			return false;
+		}
+
+		return self::row_has_parent_scu( $variation_id ) !== '';
+	}
+
+	/**
+	 * @param int                    $post_id
+	 * @param array|SimpleXMLElement $xml_node
+	 * @param bool                   $is_update
+	 * @return bool
+	 */
+	private static function should_apply_polylang_on_product_create( $post_id, $xml_node, $is_update ) {
+		if ( $is_update || get_post_type( $post_id ) !== 'product' ) {
+			return false;
+		}
+
+		if ( ! self::is_woocommerce_product_import_context() ) {
+			return false;
+		}
+
+		return self::get_local_from_xml_node( $xml_node ) !== '';
 	}
 
 	/**
@@ -165,10 +265,6 @@ class Wpai_Casalusso_Import {
 	 * @return string
 	 */
 	private static function get_local_from_import_context() {
-		if ( self::get_current_import_id() !== 3 ) {
-			return '';
-		}
-
 		if ( class_exists( 'Wpai\WordPress\AttachmentHandler' ) && ! empty( \Wpai\WordPress\AttachmentHandler::$importData['current_xml_node'] ) ) {
 			$node = (array) \Wpai\WordPress\AttachmentHandler::$importData['current_xml_node'];
 
@@ -197,10 +293,6 @@ class Wpai_Casalusso_Import {
 	 * @return string
 	 */
 	private static function get_parent_scu_from_import_context() {
-		if ( self::get_current_import_id() !== 3 ) {
-			return '';
-		}
-
 		if ( class_exists( 'Wpai\WordPress\AttachmentHandler' ) && ! empty( \Wpai\WordPress\AttachmentHandler::$importData['current_xml_node'] ) ) {
 			$node = (array) \Wpai\WordPress\AttachmentHandler::$importData['current_xml_node'];
 
@@ -270,7 +362,8 @@ class Wpai_Casalusso_Import {
 	 * @return int
 	 */
 	public static function filter_variable_product_parent_post_id( $parent_id ) {
-		if ( self::get_current_import_id() !== 3 ) {
+		$post_id = self::get_import_row_post_id();
+		if ( ! $post_id || ! self::should_fix_variation_parent( $post_id ) ) {
 			return $parent_id;
 		}
 
@@ -299,20 +392,13 @@ class Wpai_Casalusso_Import {
 	 * @return int
 	 */
 	private static function resolve_variable_parent_for_post( $post_id, $import_id ) {
-		if ( ! $post_id || $import_id !== 3 ) {
+		if ( ! $post_id ) {
 			return 0;
 		}
 
-		$local = self::get_local_for_post_in_import( $post_id, $import_id );
-		if ( $local === '' ) {
-			$local = self::get_local_from_import_context();
-		}
-
-		$parent_scu = get_post_meta( $post_id, '_parent_sku', true );
-		$parent_scu = $parent_scu !== '' ? trim( (string) $parent_scu ) : '';
-		if ( $parent_scu === '' ) {
-			$parent_scu = self::get_parent_scu_from_import_context();
-		}
+		$import_id = $import_id ? (int) $import_id : self::get_current_import_id();
+		$local     = self::row_has_language_context( $post_id, $import_id );
+		$parent_scu = self::row_has_parent_scu( $post_id );
 
 		if ( $local === '' || $parent_scu === '' ) {
 			return 0;
@@ -332,15 +418,13 @@ class Wpai_Casalusso_Import {
 	 * @return void
 	 */
 	private static function apply_variation_parent_fix( $variation_id, $import_id ) {
-		if ( (int) $import_id !== 3 || get_post_type( $variation_id ) !== 'product_variation' ) {
+		if ( ! self::should_fix_variation_parent( $variation_id, $import_id ) ) {
 			return;
 		}
 
+		$import_id     = $import_id ? (int) $import_id : self::get_current_import_id();
 		$before_parent = (int) wp_get_post_parent_id( $variation_id );
-		$local = self::get_local_for_post_in_import( $variation_id, $import_id );
-		if ( $local === '' ) {
-			$local = self::get_local_from_import_context();
-		}
+		$local         = self::row_has_language_context( $variation_id, $import_id );
 
 		$parent_id = self::resolve_variable_parent_for_post( $variation_id, $import_id );
 		if ( ! $parent_id ) {
@@ -393,12 +477,13 @@ class Wpai_Casalusso_Import {
 	 * @return void
 	 */
 	public static function fix_variation_parent_after_row( $import_id ) {
-		if ( (int) $import_id !== 3 ) {
-			return;
+		$import_id = (int) $import_id;
+		if ( ! $import_id ) {
+			$import_id = self::get_current_import_id();
 		}
-
 		$post_id = self::get_import_row_post_id();
-		if ( ! $post_id || get_post_type( $post_id ) !== 'product_variation' ) {
+
+		if ( ! self::should_fix_variation_parent( $post_id, $import_id ) ) {
 			return;
 		}
 
@@ -406,7 +491,7 @@ class Wpai_Casalusso_Import {
 			date( 'Y-m-d H:i:s' ) . ' hook=pmxi_after_post_import import=' . (int) $import_id
 			. ' pid=' . (int) $post_id . "\n"
 		);
-		self::apply_variation_parent_fix( $post_id, 3 );
+		self::apply_variation_parent_fix( $post_id, $import_id );
 	}
 
 	/**
@@ -696,13 +781,11 @@ class Wpai_Casalusso_Import {
 		$group_id     = '';
 		$translations = array();
 
-		$import_id = wp_all_import_get_import_id();
-
-		if ( get_post_type( $post_id ) === 'product' && ! $is_update && ( $import_id == '1' || $import_id == '3' ) ) {
+		if ( self::should_apply_polylang_on_product_create( $post_id, $xml_node, $is_update ) ) {
 			$log_message .= "========================================\n";
 
 			$xml_node = (array) $xml_node;
-			$local    = $xml_node['local'];
+			$local    = self::get_local_from_xml_node( $xml_node );
 			$log_message .= 'xml_node: ' . print_r( $xml_node, true ) . "\n";
 			$sku = $xml_node['scu'];
 
