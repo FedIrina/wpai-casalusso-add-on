@@ -219,3 +219,92 @@ function wpai_casalusso_make_vars_string( $input, $local = '' ) {
 
 	return $json;
 }
+
+/**
+ * Преобразует список названий атрибутов в формат мета _display_with_quantity_attributes.
+ *
+ * Вход (CSV): "Цвет, Размер" / "Color" / "Цвет;Размер".
+ * Выход (meta): array( 'pa_czvet' => 'yes', 'pa_razmer' => 'yes' ).
+ *
+ * @param string $raw_labels Названия атрибутов из CSV (человекочитаемые).
+ * @return string Сериализованный массив для записи в post meta.
+ */
+function wpai_casalusso_make_qty_attr_map( $raw_labels ) {
+	$raw_labels = trim( (string) $raw_labels );
+	$result     = array();
+
+	if ( $raw_labels === '' ) {
+		return maybe_serialize( $result );
+	}
+
+	$labels = preg_split( '/[;,]/', $raw_labels );
+	if ( ! is_array( $labels ) ) {
+		return maybe_serialize( $result );
+	}
+
+	$labels = array_filter(
+		array_map(
+			static function ( $label ) {
+				return mb_strtolower( trim( (string) $label ) );
+			},
+			$labels
+		),
+		static function ( $label ) {
+			return $label !== '';
+		}
+	);
+
+	if ( empty( $labels ) ) {
+		return maybe_serialize( $result );
+	}
+
+	$label_to_taxonomy = array();
+	$taxonomies        = wc_get_attribute_taxonomies();
+	if ( is_array( $taxonomies ) ) {
+		foreach ( $taxonomies as $taxonomy ) {
+			if ( empty( $taxonomy->attribute_name ) ) {
+				continue;
+			}
+
+			$taxonomy_name = wc_attribute_taxonomy_name( $taxonomy->attribute_name ); // pa_*
+			$label         = mb_strtolower( trim( (string) $taxonomy->attribute_label ) );
+			$name          = mb_strtolower( trim( (string) $taxonomy->attribute_name ) );
+
+			if ( $label !== '' ) {
+				$label_to_taxonomy[ $label ] = $taxonomy_name;
+			}
+			if ( $name !== '' ) {
+				$label_to_taxonomy[ $name ] = $taxonomy_name;
+			}
+			$label_to_taxonomy[ mb_strtolower( wc_attribute_label( $taxonomy_name ) ) ] = $taxonomy_name;
+		}
+	}
+
+	foreach ( $labels as $label ) {
+		if ( isset( $label_to_taxonomy[ $label ] ) ) {
+			$result[ $label_to_taxonomy[ $label ] ] = 'yes';
+		}
+	}
+
+	return maybe_serialize( $result );
+}
+
+/**
+ * Колонка Availability CSV → yes|no.
+ *
+ * «В наличии» → yes, любое другое значение (например «Предзаказ») → no.
+ *
+ * WPAI: [wpai_casalusso_availability_to_yes_no({availability[1]})]
+ *
+ * @param string $availability Значение Availability из строки импорта.
+ * @return string yes|no
+ */
+function wpai_casalusso_availability_to_yes_no( $availability ) {
+	$availability = trim( (string) $availability );
+
+	if ( $availability === 'В наличии' ) {
+		return 'yes';
+	}
+
+	return 'no';
+}
