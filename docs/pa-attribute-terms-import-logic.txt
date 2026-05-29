@@ -1,0 +1,217 @@
+# Логика импорта терминов pa_* (атрибуты WooCommerce) — wpai-casalusso-add-on
+
+Дата актуальности: 2026-05-19
+Файл кода: includes/class-wpai-casalusso-import.php
+
+Условия работы add-on для pa_*:
+- импорты WP All Import #1 и #3;
+- новый товар (!$is_update);
+- post_type === product;
+- атрибуты включены в Polylang / woo-poly (is_woopoly_feature_enabled('attributes')).
+
+================================================================================
+ОБЩАЯ СХЕМА (ДВА ЭТАПА)
+================================================================================
+
+Этап 1 — во время обработки строки CSV (WPAI создаёт/находит термин и вешает на товар):
+  CSV (Density + Local) → WPAI ImportProduct → фильтр wp_all_import_term_exists
+  → при необходимости wp_insert_term → хук create_term @998 (язык)
+  → Polylang create_term @999 (если языка ещё нет)
+
+Этап 2 — после сохранения товара (связь переводов терминов по SKU):
+  pmxi_saved_post → assign_language_on_import → sync_product_attribute_terms_by_sku
+  → ensure_term_language + pll_get_term + link_term_translations
+
+================================================================================
+КОНТЕКСТ CSV
+================================================================================
+
+WPAI кладёт текущую строку в:
+  Wpai\WordPress\AttachmentHandler::$importData['current_xml_node']
+
+Add-on читает:
+  - Local (local / Local / LOCAL) → язык строки: ru, en, tr, de
+    Метод: get_local_from_import_context()
+
+  - Значение атрибута из CSV (например поле Density: "1200 г/м2", "1200 gr/m2")
+    Сохраняется в $attribute_value_hint при проходе фильтра wp_all_import_term_exists
+    Slug для сравнения: sanitize_title(значение) — get_csv_attribute_slug_for_row()
+
+Важно: Local — это язык, не slug. Slug строится из значения атрибута (Density).
+
+================================================================================
+ЭТАП 1: СОЗДАНИЕ И ЯЗЫК ТЕРМИНА
+================================================================================
+
+--------------------------------------------------------------------------------
+Хук 1: create_term (приоритет 998)
+--------------------------------------------------------------------------------
+
+Регистрация:  Wpai_Casalusso_Import::init()
+Обработчик:   set_attribute_term_language_on_create()
+Когда:        сразу после wp_insert_term(), ДО Polylang на приоритете 999
+
+Логика:
+  - только таксономии pa_*;
+  - только импорты 1/3, товар;
+  - pll_set_term_language( $term_id, Local ) из CSV;
+  - Polylang на 999 не перезаписывает язык, если он уже задан на 998.
+
+Срабатывает только при СОЗДАНИИ нового термина (wp_insert_term).
+Если термин только НАЙДЕН — этот хук не вызывается.
+
+Лог: create_term pa_plotnost #ID: (none) -> ru
+
+--------------------------------------------------------------------------------
+Фильтр 2: wp_all_import_term_exists (приоритет 10)
+--------------------------------------------------------------------------------
+
+Регистрация:  init()
+Обработчик:   filter_term_exists_by_language()
+Кто вызывает: WPAI в ImportProduct.php:
+  - после get_term_by('name', $value, pa_*)
+  - внутри is_exists_term() (поиск по slug, затем по name)
+
+Логика:
+  1. Только pa_*, импорты 1/3.
+  2. Сброс $attribute_value_hint при смене pid товара в строке.
+  3. Запоминается имя из CSV (пробелы / кириллица) в $attribute_value_hint.
+
+  4. Если язык найденного термина ≠ Local:
+     - лог: skip existing … (lang X) for Local Y
+     - resolve_or_create_attribute_term_for_language()
+     - вернуть массив term_id или false («термина нет» для WPAI)
+
+  5. Если язык совпал, но slug термина ≠ slug из CSV:
+     - лог: skip existing … slug "A" != expected "B"
+     - создать/найти термин с правильным slug (forced_slug)
+
+  6. Иначе — вернуть найденный термин без изменений.
+
+Вспомогательный метод: resolve_or_create_attribute_term_for_language()
+
+  Шаг 1: pll_get_term( $found_id, $local ) — если перевод уже есть, вернуть его
+  Шаг 2: Имя — из CSV ($attribute_value_hint), не с «чужого» термина
+  Шаг 3: Slug нового термина:
+          - при другом языке: {base}-{local}  (напр. 1200-gr-m2-tr)
+          - при несовпадении slug при том же языке: явный slug из CSV (1200-gm2)
+  Шаг 4: get_term_by('slug') — переиспользовать, если язык совпадает
+  Шаг 5: pll_insert_term() или wp_insert_term() + pll_set_term_language()
+
+Кэш static на ключ taxonomy:existing_term_id:local — не дублировать при 3 вызовах
+фильтра за одну строку (name / slug / htmlspecialchars).
+
+API Polylang: pll_get_term_language, pll_get_term, pll_insert_term, pll_set_term_language
+
+НЕ используется: pll_inserted_term_language
+(WPAI вызывает голый wp_insert_term; этот фильтр — только в pll_insert_term Polylang)
+
+--------------------------------------------------------------------------------
+Цепочка WPAI (вне add-on)
+--------------------------------------------------------------------------------
+
+ImportProduct::getAttributesData() в wpai-woocommerce-add-on:
+
+  1. get_term_by( 'name', $value, pa_* )
+  2. apply_filters( 'wp_all_import_term_exists', … )  ← наш фильтр
+  3. is_exists_term( $term_slug ) → снова тот же фильтр
+  4. is_exists_term( htmlspecialchars( $term_slug ) )
+  5. wp_insert_term( $value, pa_* )  ← наш create_term @998
+
+WPAI передаёт явный slug в wp_insert_term только если в значении есть символ '#'.
+
+WordPress: при том же имени можно создать второй термин, если передан уникальный slug
+(см. wp_insert_term: "unless a unique slug has been explicitly provided").
+
+================================================================================
+ЭТАП 2: СВЯЗЬ ПЕРЕВОДОВ ТЕРМИНОВ (ПО SKU)
+================================================================================
+
+--------------------------------------------------------------------------------
+Хук 3: pmxi_saved_post (приоритет 10)
+--------------------------------------------------------------------------------
+
+Обработчик: assign_language_on_import()
+Условие:    product, !is_update, import 1 или 3
+
+В конце (для атрибутов):
+  sync_product_attribute_terms_by_sku( $post_id, $sku )
+
+--------------------------------------------------------------------------------
+Внутренние методы (отдельные WP-хуки не регистрируют)
+--------------------------------------------------------------------------------
+
+sync_product_attribute_terms_by_sku()
+  → get_translated_product_attribute_taxonomies() — все pa_* из Polylang
+  → get_products_by_sku_for_translations() — [ ru => post_id, en => … ]
+  → для каждой pa_*: sync_flat_translated_terms_for_products()
+
+sync_flat_translated_terms_for_products()
+  Для каждого товара по языку:
+    - term_ids с товара (get_object_term_ids_ordered)
+    - pa_*: resolve_term_id_for_product_language() — pll_get_term(), подмена term_id
+    - ensure_term_language( $term_id, $lang, $product_id )
+      * не менять язык, если термин уже на другом товаре того же языка
+    - при подмене: wp_set_object_terms() на товаре
+  → link_flat_terms_by_lang()
+
+link_flat_terms_by_lang()
+  Один термин на язык на атрибут → link_term_translations( { ru: id, en: id, … } )
+
+link_term_translations()
+  Группа в таксономии term_translations (сериализованный массив lang => term_id).
+  Не pll_save_term_translations(), ручная запись как у постов post_translations.
+
+API Polylang в sync:
+  pll_get_term, pll_get_term_language, pll_set_term_language,
+  pll_get_term_translations, pll_is_translated_taxonomy
+
+================================================================================
+СВОДНАЯ ТАБЛИЦА ХУКОВ ADD-ON
+================================================================================
+
+| Хук / фильтр              | Тип    | Приоритет | Метод                              | pa_* |
+|---------------------------|--------|-----------|-------------------------------------|------|
+| create_term               | action | 998       | set_attribute_term_language_on_create | да   |
+| wp_all_import_term_exists | filter | 10        | filter_term_exists_by_language        | да   |
+| pmxi_saved_post           | action | 10        | assign_language_on_import → sync      | да   |
+
+wp_all_import_variable_product_imported — к pa_* не относится.
+
+================================================================================
+ПРИМЕР: СТРОКА tr, Density = "1200 gr/m2", SKU 818721
+================================================================================
+
+1. WPAI находит en-термин по имени/slug → фильтр: язык en ≠ tr
+2. resolve: pll_get_term или создать 1200-gr-m2-tr, язык tr
+3. При wp_insert_term → create_term @998: pll_set_term_language( tr )
+4. Термин привязан к товару tr
+5. pmxi_saved_post → sync по SKU → link ru/en/tr/de в term_translations
+
+================================================================================
+ЛОГ
+================================================================================
+
+Файл: wp-content/uploads/product_taxonomies.log
+
+Типичные строки:
+  create_term pa_plotnost #…: … -> ru
+  skip existing pa_plotnost #… (lang en) for Local tr, value "1200 gr/m2"
+  created pa_plotnost #… lang tr slug 1200-gr-m2-tr name "1200 gr/m2"
+  skip existing pa_plotnost #… slug "1200-gr-m2" != expected "1200-gm2" (Local ru)
+  use translation pa_plotnost #… (tr) of #…
+  reuse pa_plotnost #… slug … (de)
+  sync_product_attribute_terms_by_sku SKU=818721
+  product 2028 (ru) pa_plotnost: 1692
+  reassigned pa_plotnost on product … (tr): …
+  linked pa_plotnost (single): {"ru":1692,"en":1695,"tr":1696,"de":1697}
+  link_term_translations group pll_…: {"ru":…,"en":…,"tr":…,"de":…}
+
+================================================================================
+СВЯЗАННЫЕ ФАЙЛЫ
+================================================================================
+
+- includes/class-wpai-casalusso-import.php — вся логика
+- wpai-woocommerce-add-on/src/importer/products/ImportProduct.php — wp_insert_term, фильтр term_exists
+- polylang: pll_insert_term, PLL_CRUD_Terms::save_term на create_term @999
+- docs/woo-poly-integration-import-analysis.txt — общий контекст woo-poly
